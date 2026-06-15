@@ -662,6 +662,53 @@ function cssColor(v) {
   return c;
 }
 
+/* Canvas on older iPad iOS Safari cannot parse oklch() or color-mix() —
+   addColorStop() throws and the globe never renders. So convert every canvas
+   colour to a plain rgb() string in JS (deterministic, engine-independent),
+   and blend land shades in JS instead of color-mix(). */
+function _srgb(c) {                       // linear -> gamma-encoded sRGB, 0..255
+  c = c <= 0.0031308 ? 12.92 * c : 1.055 * Math.pow(c, 1 / 2.4) - 0.055;
+  return Math.max(0, Math.min(255, Math.round(c * 255)));
+}
+function _oklchToRgb(L, C, H) {           // H in degrees
+  const h = H * Math.PI / 180, a = C * Math.cos(h), b = C * Math.sin(h);
+  const l_ = L + 0.3963377774 * a + 0.2158037573 * b;
+  const m_ = L - 0.1055613458 * a - 0.0638541728 * b;
+  const s_ = L - 0.0894841775 * a - 1.2914855480 * b;
+  const l = l_ ** 3, m = m_ ** 3, s = s_ ** 3;
+  return [
+    _srgb(+4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s),
+    _srgb(-1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s),
+    _srgb(-0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s),
+  ];
+}
+const _rgbCache = {};
+/* Returns [r,g,b] for a 'var(--x)' token whose value is an oklch() colour. */
+function resolveRGB(v) {
+  if (_rgbCache[v]) return _rgbCache[v];
+  const raw = v.startsWith('var(') ? cssColor(v) : v;
+  const m = raw.match(/oklch\(\s*([\d.]+)(%?)\s+([\d.]+)\s+([\d.-]+)/i);
+  let rgb;
+  if (m) {
+    const L = m[2] ? parseFloat(m[1]) / 100 : parseFloat(m[1]);
+    rgb = _oklchToRgb(L, parseFloat(m[3]), parseFloat(m[4]));
+  } else {
+    const n = raw.match(/-?[\d.]+/g);
+    rgb = n && n.length >= 3 ? n.slice(0, 3).map(Number) : [136, 136, 136];
+  }
+  _rgbCache[v] = rgb;
+  return rgb;
+}
+function resolveColor(v) { const c = resolveRGB(v); return 'rgb(' + c[0] + ',' + c[1] + ',' + c[2] + ')'; }
+/* t = how much of `lit` token (0..1); rest is `dark` token. */
+function mixRGB(darkTok, litTok, t) {
+  const a = resolveRGB(darkTok), b = resolveRGB(litTok);
+  return 'rgb(' +
+    Math.round(a[0] + (b[0] - a[0]) * t) + ',' +
+    Math.round(a[1] + (b[1] - a[1]) * t) + ',' +
+    Math.round(a[2] + (b[2] - a[2]) * t) + ')';
+}
+
 function densify(poly) {
   const out = [];
   for (let i = 0; i < poly.length; i++) {
@@ -756,8 +803,8 @@ function render() {
 
   // ocean sphere, lit from the top-left
   const g = ctx.createRadialGradient(CX - R * 0.4, CY - R * 0.45, R * 0.1, CX, CY, R);
-  g.addColorStop(0, cssColor('var(--ocean-lit)'));
-  g.addColorStop(1, cssColor('var(--ocean-dark)'));
+  g.addColorStop(0, resolveColor('var(--ocean-lit)'));
+  g.addColorStop(1, resolveColor('var(--ocean-dark)'));
   ctx.beginPath();
   ctx.arc(CX, CY, R, 0, Math.PI * 2);
   ctx.fillStyle = g;
@@ -770,7 +817,7 @@ function render() {
   ctx.clip();
 
   // graticule
-  ctx.strokeStyle = cssColor('var(--grid)');
+  ctx.strokeStyle = resolveColor('var(--grid)');
   ctx.globalAlpha = 0.16;
   ctx.lineWidth = 1;
   for (let lat = -60; lat <= 60; lat += 30) drawLine(line(lon => [lon, lat], -180, 180, 5));
@@ -778,9 +825,9 @@ function render() {
   ctx.globalAlpha = 1;
 
   // land with simple shaded relief (front-facing toward the light is brighter)
-  const litColor = cssColor('var(--land-lit)');
-  const darkColor = cssColor('var(--land-dark)');
-  ctx.strokeStyle = cssColor('var(--landline)');
+  const litColor = resolveColor('var(--land-lit)');
+  const darkColor = resolveColor('var(--land-dark)');
+  ctx.strokeStyle = resolveColor('var(--landline)');
   ctx.lineWidth = 1;
   for (const poly of LAND_D) {
     let anyFront = false, zsum = 0, zc = 0;
@@ -794,7 +841,7 @@ function render() {
     // lighting: blend lit/dark by how much the patch faces the top-left light
     const zavg = zc ? zsum / zc : 0;
     const t = Math.max(0, Math.min(1, 0.35 + zavg * 0.75));
-    ctx.fillStyle = 'color-mix(in oklch, ' + litColor + ' ' + Math.round(t * 100) + '%, ' + darkColor + ')';
+    ctx.fillStyle = mixRGB(darkColor, litColor, t);
     ctx.globalAlpha = 1;
     ctx.beginPath();
     pts.forEach(([x, y], i) => i ? ctx.lineTo(x, y) : ctx.moveTo(x, y));
